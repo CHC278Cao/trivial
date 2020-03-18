@@ -6,6 +6,8 @@ import pandas as pd
 import numpy as np
 import time
 from sklearn import metrics
+from sklearn import preprocessing
+from sklearn import model_selection
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -15,47 +17,19 @@ from src import categorical
 from src import cross_validation
 from .import entityModel
 
-FOLD_MAPPING = {
-    0: [1, 2, 3, 4],
-    1: [0, 2, 3, 4],
-    2: [0, 1, 3, 4],
-    3: [0, 1, 2, 4],
-    4: [0, 1, 2, 3]
-}
 
-def get_encoding(df, df_test):
-    train_len = len(df)
-    df_test["target"] = -1
-    full_data = pd.concat([df, df_test])
+def get_encoding(train_df, test_df):
+    test_df["target"] = -1
+    full_data = pd.concat([df, df_test]).reset_index(drop=True)
     cols = [c for c in df.columns if c not in ["id", "target"]]
-    encoding_type = "label"
-    cat_feats = categorical.CategoricalFeatures(full_data,
-                                                categorical_features=cols,
-                                                encoding_type=encoding_type,
-                                                handle_na=True
-                                                )
-    # pdb.set_trace()
+    for c in cols:
+        lbl = preprocessing.LabelEncoder()
+        lbl.fit(full_data[c].astype(str).fillna('None').values)
+        train_df[c] = lbl.transform(train_df[c].astype(str).fillna("None").values)
+        test_df[c] = lbl.transform(test_df[c].astype(str).fillna('None').values)
 
-    full_data_transformed = cat_feats.fit_transform()
-    if encoding_type == "label":
-        X = full_data_transformed.iloc[:train_len, :]
-        X_test = full_data_transformed.iloc[train_len:, :]
-        return X, X_test
-
-    elif encoding_type == 'ohe':
-        X = full_data_transformed[:train_len, :]
-        X_test = full_data_transformed[train_len:, :]
-        ytrain = df.target.values
-        return X, ytrain, X_test
-
-def get_splitdf(df):
-
-    cv = cross_validation.CrossValidation(df, shuffle=True, target_cols=["target"],
-                        problem_type="binary_classification")
-    df_split = cv.split()
-    print(df_split.head())
-    print(df_split.kfold.value_counts())
-    return df_split
+    test_df.drop('target', axis=1, inplace=True)
+    return train_df, test_df
 
 
 def train_epoch(model, data_loader, optimizer, criterion, device, scheduler = None):
@@ -64,11 +38,12 @@ def train_epoch(model, data_loader, optimizer, criterion, device, scheduler = No
     running_loss = 0.0
 
     for batch_idx, data in enumerate(data_loader):
-        # pdb.set_trace()
+        pdb.set_trace()
         optimizer.zero_grad()
-        out = model(data)
-        target = data["target"].to(device)
-        loss = criterion(out, F.one_hot(target).float())
+        inputs = data["data"].to(device)
+        target = data["targets"].to(device)
+        outputs = model(inputs)
+        loss = criterion(torch.log(outputs), target.view(-1))
         running_loss += loss.item()
         loss.backward()
         optimizer.step()
@@ -89,50 +64,42 @@ def valid_epoch(model, data_loader, criterion, device):
 
     with torch.no_grad():
         for batch_idx, data in enumerate(data_loader):
-            outputs = model(data)
-            targets = data["target"].to(device)
-            loss = criterion(outputs, F.one_hot(targets).float())
-
+            inputs = data['data'].to(device)
+            targets = data["targets"].to(device)
+            outputs = model(inputs)
+            loss = criterion(torch.log(outputs), targets.view(-1))
             running_loss += loss.item()
+
             fin_outputs.append(outputs.cpu().detach().numpy()[:, -1])
             fin_targets.append(targets.view(-1).cpu().detach().numpy())
 
     return running_loss/len(data_loader), np.vstack(fin_outputs), np.vstack(fin_targets)
 
 
-def train(df, df_test, model_path):
+def train(train_df, features, emb_size_dict, model_path):
     EPOCHS = 50
     LR = 0.01
-    BATCH_SIZE = 64
+    BATCH_SIZE = 4
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    kf = model_selection.StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    for idx, (train_idx, valid_idx) in enumerate(kf.split(X = train_df, y=train_df['target'].values)):
+        X_train, y_train = train_df[features].iloc[train_idx, :], train_df['target'].iloc[train_idx]
+        X_valid, y_valid = train_df[features].iloc[valid_idx, :], train_df['target'].iloc[valid_idx]
 
+        train_dataset = entityModel.entityDataset(X_train, y_train)
+        train_data_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                                        drop_last=True)
 
-    features = [x for x in df.columns if x not in ["id", "target", "kfold"]]
-    emb_size_dict = {}
-    for c in features:
-        num_features = int(df[c].nunique())
-        emb_size = int(min(np.ceil(num_features / 2), 50))
-        emb_size_dict[c] = (num_features + 1, emb_size)
-
-    pdb.set_trace()
-
-    for FOLD in range(5):
-        train_df = df[df.kfold.isin(FOLD_MAPPING.get(FOLD))].reset_index(drop=True)
-        valid_df = df[df.kfold == FOLD].reset_index(drop=True)
-
-
-        train_dataset = entityModel.entityDataset(train_df, emb_size_dict.keys(), 'target')
-        train_data_loader = torch.utils.data.DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
-
-        valid_dataset = entityModel.entityDataset(valid_df, emb_size_dict.keys(), 'target')
-        valid_data_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        valid_dataset = entityModel.entityDataset(X_valid, y_valid)
+        valid_data_loader = torch.utils.data.DataLoader(valid_dataset, batch_size=BATCH_SIZE, shuffle=True,
+                                                        drop_last=True)
 
         model = entityModel.EmbedModel(emb_size_dict, 2, 0.3, 0.2, DEVICE)
-        criterion = nn.BCELoss()
+        criterion = nn.NLLLoss()
         optimizer = Adam(model.parameters(), lr = LR)
 
         STEP_SIZE = int(len(train_dataset) / BATCH_SIZE * 3)
-        scheduler = lr_scheduler.StepLR(optimizer, step_size=STEP_SIZE, gamma=0.9)
+        scheduler = lr_scheduler.StepLR(optimizer, step_size=STEP_SIZE, gamma=0.2)
 
         PATIENT = 3
         BEST_VALID_LOSS = float("inf")
@@ -141,7 +108,8 @@ def train(df, df_test, model_path):
         pdb.set_trace()
         for epoch in range(EPOCHS):
             start_time = time.time()
-            train_loss = train_epoch(model, train_data_loader, optimizer, criterion, DEVICE, scheduler)
+            train_loss = train_epoch(model, train_data_loader, optimizer, criterion, DEVICE,
+                                     scheduler)
             print(f"epoch = {epoch+1}, loss = {train_loss}, time = {time.time() - start_time}")
             valid_loss, fin_outputs, fin_targets = valid_epoch(model, valid_data_loader,
                                                                criterion, DEVICE)
@@ -150,7 +118,7 @@ def train(df, df_test, model_path):
             if valid_loss < BEST_VALID_LOSS:
                 BEST_VALID_LOSS = valid_loss
                 cnt = 0
-                torch.save(model.state_dict(), f"{model_path}/entity_{FOLD}.bin")
+                torch.save(model.state_dict(), f"{model_path}/entity_{idx}.bin")
             else:
                 cnt += 1
                 if cnt > PATIENT:
@@ -162,14 +130,20 @@ def train(df, df_test, model_path):
     predict(df_test, emb_size_dict, model, model_path)
 
 
-def predict(df_test, emb_size_dict, model, model_path):
+def predict(test_df, features, emb_size_dict, model_path):
     test_idx = df_test.id.values
-    test_dataset = entityModel.entityDataset(df_test, emb_size_dict.keys())
+    test_df = test_df[features]
+
+    test_dataset = entityModel.entityDataset(test_df)
     test_data_loader = torch.utils.data.DataLoader(test_dataset, batch_size=64, shuffle=False)
+
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     predict = None
     for FOLD in range(5):
         print("current FOLD is {}".format(FOLD))
+
+        model = entityModel.EmbedModel(emb_size_dict, 2, 0.3, 0.2, DEVICE)
         model.load_state_dict(torch.load(f"{model_path}/entity_{FOLD}.bin", map_location=torch.device('cpu')))
         model.eval()
         fold_predict = []
@@ -206,23 +180,22 @@ if __name__ == '__main__':
 
     # train(df=df, model_type=MODEL_TYPE, model_path=MODEL_PATH)
     # sub = predict(df_test=df_test, model_path=MODEL_PATH, model_type=MODEL_TYPE)
-    df, df_test = get_encoding(df, df_test)
-    # X = get_splitdf(df)
+    pdb.set_trace()
+    train_df, test_df = get_encoding(df, df_test)
 
-    # train(X, df_test, MODEL_PATH)
-    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    features = [x for x in df.columns if x not in ["id", "target", "kfold"]]
-    emb_size_dict = {}
+    features = [x for x in train_df.columns if x not in ["id", "target"]]
+    emb_size_dict = []
+
     for c in features:
         num_features = int(df[c].nunique())
         emb_size = int(min(np.ceil(num_features / 2), 50))
-        emb_size_dict[c] = (num_features + 1, emb_size)
+        emb_size_dict.append((num_features + 1, emb_size))
+    # X = get_splitdf(df)
+    train(train_df, features, emb_size_dict, MODEL_PATH)
 
-    model = entityModel.EmbedModel(emb_size_dict, 2, 0.3, 0.2, DEVICE)
-
-    sub = predict(df_test, emb_size_dict, model, MODEL_PATH)
-    pdb.set_trace()
-    sub.to_csv(f"{SUBMISSION}/entity_1.csv", index=False)
+    # sub = predict(df_test, emb_size_dict, model, MODEL_PATH)
+    # pdb.set_trace()
+    # sub.to_csv(f"{SUBMISSION}/entity_1.csv", index=False)
 
 
 
