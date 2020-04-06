@@ -269,14 +269,14 @@ class ImgDataset(Dataset):
         if img.shape[2] == 1:
             img[tuple(yx)] = 1.0
         elif img.shape[2] > 1:
-            img[tuple(yx)] = [1.0] * img.shape[2]
+            img[tuple(yx)] = torch.tensor([1.0] * img.shape[2], dtype=torch.float)
 
         # Pepper mode
         yx = [np.random.randint(0, d - 1, num_salt) for d in img.shape[:2]]
         if img.shape[2] == 1:
             img[tuple(yx)] = 0.0
         elif img.shape[2] > 1:
-            img[tuple(yx)] = [0.0] * img.shape[2]
+            img[tuple(yx)] = torch.tensor([1.0] * img.shape[2], dtype=torch.float)
         img = torch.clamp(img, 0., 1.)
 
         return img
